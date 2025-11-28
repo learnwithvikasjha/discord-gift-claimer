@@ -31,6 +31,10 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _format_ms(value) -> str:
+    return f"{value:.1f}ms" if value is not None else "?"
+
+
 @dataclass
 class Config:
     token: str
@@ -116,13 +120,17 @@ async def main() -> None:
         return True
 
     async def click_claim_button(message: discord.Message, event_received_at: datetime) -> bool:
+        seen_labels = []
+        saw_claim_label = False
         for row in message.components:
             for component in getattr(row, "children", []):
                 label = getattr(component, "label", "")
+                seen_labels.append(label)
                 normalized = label.strip().lower() if label else ""
                 if not normalized or normalized not in claim_labels:
                     continue
 
+                saw_claim_label = True
                 custom_id = getattr(component, "custom_id", None)
                 is_url = bool(getattr(component, "url", None))
                 disabled = bool(getattr(component, "disabled", False))
@@ -175,6 +183,19 @@ async def main() -> None:
                         exc,
                     )
                     return False
+
+        if saw_claim_label:
+            logger.info(
+                "No clickable claim buttons on message %s (labels=%s)",
+                message.id,
+                ", ".join(repr(label) for label in seen_labels) if seen_labels else "none",
+            )
+        else:
+            logger.info(
+                "No claim labels matched on message %s (labels=%s)",
+                message.id,
+                ", ".join(repr(label) for label in seen_labels) if seen_labels else "none",
+            )
         return False
 
     async def handle_message(message: discord.Message, source: str) -> None:
@@ -185,24 +206,32 @@ async def main() -> None:
             created_age_ms = (event_received_at - message.created_at).total_seconds() * 1000
         if getattr(message, "edited_at", None):
             edited_age_ms = (event_received_at - message.edited_at).total_seconds() * 1000
-
-        if message.author == client.user:
-            return
-        if not message.components:
-            return
-        if not message_allowed(message):
-            return
+        components = getattr(message, "components", None) or []
+        component_children = []
+        for row in components:
+            component_children.extend(getattr(row, "children", []))
 
         logger.info(
-            "%s event for message %s in %s (created_age=%s%s)",
+            "%s event for message %s in %s (created_age=%s edited_age=%s components=%s)",
             source,
             message.id,
             message.channel,
-            f"{created_age_ms:.1f}ms" if created_age_ms is not None else "?",
-            f", edited_age={edited_age_ms:.1f}ms" if edited_age_ms is not None else "",
+            _format_ms(created_age_ms),
+            _format_ms(edited_age_ms),
+            len(component_children),
         )
 
+        if message.author == client.user:
+            logger.info("Skipping message %s (self message)", message.id)
+            return
+        if not message_allowed(message):
+            logger.info("Skipping message %s (not in allowlists)", message.id)
+            return
+        if not component_children:
+            logger.info("Skipping message %s (no components with children)", message.id)
+            return
         if message.id in processed_messages:
+            logger.info("Skipping message %s (already processed)", message.id)
             return
 
         clicked = await click_claim_button(message, event_received_at)
