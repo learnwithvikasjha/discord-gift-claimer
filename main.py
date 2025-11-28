@@ -119,9 +119,14 @@ async def main() -> None:
             return False
         return True
 
-    async def click_claim_button(message: discord.Message, event_received_at: datetime) -> bool:
+    async def click_claim_button(message: discord.Message, event_received_at: datetime, source: str) -> bool:
+        """Attempt to click the first allowed button as fast as possible."""
         seen_labels = []
         saw_claim_label = False
+        now = _utcnow()
+        created_age_ms = (now - message.created_at).total_seconds() * 1000 if getattr(message, "created_at", None) else None
+        edited_age_ms = (now - message.edited_at).total_seconds() * 1000 if getattr(message, "edited_at", None) else None
+
         for row in message.components:
             for component in getattr(row, "children", []):
                 label = getattr(component, "label", "")
@@ -136,12 +141,7 @@ async def main() -> None:
                 disabled = bool(getattr(component, "disabled", False))
 
                 if disabled:
-                    logger.info(
-                        'Skipping disabled button "%s" on message %s in %s',
-                        label,
-                        message.id,
-                        message.channel,
-                    )
+                    logger.info('Skipping disabled button "%s" on message %s in %s', label, message.id, message.channel)
                     continue
 
                 if is_url or not custom_id:
@@ -155,31 +155,34 @@ async def main() -> None:
                     )
                     continue
 
-                now = _utcnow()
-                created_age_ms = None
-                if getattr(message, "created_at", None):
-                    created_age_ms = (now - message.created_at).total_seconds() * 1000
-                since_event_ms = (now - event_received_at).total_seconds() * 1000
-
-                logger.info(
-                    'Attempting click "%s" on message %s in %s (age=%s since_event=%s custom_id=%s)',
-                    label or next(iter(config.claim_button_texts)),
-                    message.id,
-                    message.channel,
-                    f"{created_age_ms:.1f}ms" if created_age_ms is not None else "?",
-                    f"{since_event_ms:.1f}ms",
-                    custom_id,
-                )
+                processed_messages.add(message.id)  # prevent duplicate attempts on rapid edits
+                before_click = _utcnow()
+                since_event_ms = (before_click - event_received_at).total_seconds() * 1000
                 try:
                     await component.click()
+                    after_click = _utcnow()
+                    total_since_event_ms = (after_click - event_received_at).total_seconds() * 1000
+                    logger.info(
+                        'Clicked "%s" on message %s in %s via %s (age=%s edited_age=%s since_event=%s after_click=%s custom_id=%s)',
+                        label or next(iter(config.claim_button_texts)),
+                        message.id,
+                        message.channel,
+                        source,
+                        _format_ms(created_age_ms),
+                        _format_ms(edited_age_ms),
+                        _format_ms(since_event_ms),
+                        _format_ms(total_since_event_ms),
+                        custom_id,
+                    )
                     return True
                 except Exception as exc:
                     logger.error(
-                        'Failed to click button on message %s (custom_id=%s url=%s disabled=%s): %s',
+                        'Failed to click button on message %s (custom_id=%s url=%s disabled=%s since_event=%s): %s',
                         message.id,
                         custom_id,
                         getattr(component, "url", None),
                         disabled,
+                        _format_ms(since_event_ms),
                         exc,
                     )
                     return False
@@ -231,12 +234,10 @@ async def main() -> None:
             logger.info("Skipping message %s (no components with children)", message.id)
             return
         if message.id in processed_messages:
-            logger.info("Skipping message %s (already processed)", message.id)
+            logger.info("Skipping message %s (already processed/attempted)", message.id)
             return
 
-        clicked = await click_claim_button(message, event_received_at)
-        if clicked:
-            processed_messages.add(message.id)
+        await click_claim_button(message, event_received_at, source)
 
     @client.event
     async def on_ready():
