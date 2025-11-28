@@ -3,7 +3,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Set
 
@@ -25,6 +25,10 @@ logging.basicConfig(
 logger = logging.getLogger("claim-gift")
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -111,7 +115,7 @@ async def main() -> None:
             return False
         return True
 
-    async def click_claim_button(message: discord.Message) -> bool:
+    async def click_claim_button(message: discord.Message, event_received_at: datetime) -> bool:
         for row in message.components:
             for component in getattr(row, "children", []):
                 label = getattr(component, "label", "")
@@ -143,11 +147,19 @@ async def main() -> None:
                     )
                     continue
 
+                now = _utcnow()
+                created_age_ms = None
+                if getattr(message, "created_at", None):
+                    created_age_ms = (now - message.created_at).total_seconds() * 1000
+                since_event_ms = (now - event_received_at).total_seconds() * 1000
+
                 logger.info(
-                    'Clicking "%s" on message %s in %s (custom_id=%s)',
+                    'Attempting click "%s" on message %s in %s (age=%s since_event=%s custom_id=%s)',
                     label or next(iter(config.claim_button_texts)),
                     message.id,
                     message.channel,
+                    f"{created_age_ms:.1f}ms" if created_age_ms is not None else "?",
+                    f"{since_event_ms:.1f}ms",
                     custom_id,
                 )
                 try:
@@ -165,17 +177,35 @@ async def main() -> None:
                     return False
         return False
 
-    async def handle_message(message: discord.Message) -> None:
+    async def handle_message(message: discord.Message, source: str) -> None:
+        event_received_at = _utcnow()
+        created_age_ms = None
+        edited_age_ms = None
+        if getattr(message, "created_at", None):
+            created_age_ms = (event_received_at - message.created_at).total_seconds() * 1000
+        if getattr(message, "edited_at", None):
+            edited_age_ms = (event_received_at - message.edited_at).total_seconds() * 1000
+
         if message.author == client.user:
             return
         if not message.components:
             return
-        if message.id in processed_messages:
-            return
         if not message_allowed(message):
             return
 
-        clicked = await click_claim_button(message)
+        logger.info(
+            "%s event for message %s in %s (created_age=%s%s)",
+            source,
+            message.id,
+            message.channel,
+            f"{created_age_ms:.1f}ms" if created_age_ms is not None else "?",
+            f", edited_age={edited_age_ms:.1f}ms" if edited_age_ms is not None else "",
+        )
+
+        if message.id in processed_messages:
+            return
+
+        clicked = await click_claim_button(message, event_received_at)
         if clicked:
             processed_messages.add(message.id)
 
@@ -192,11 +222,11 @@ async def main() -> None:
 
     @client.event
     async def on_message(message: discord.Message):
-        await handle_message(message)
+        await handle_message(message, source="message")
 
     @client.event
     async def on_message_edit(_, after: discord.Message):
-        await handle_message(after)
+        await handle_message(after, source="edit")
 
     await client.start(config.token)
 
