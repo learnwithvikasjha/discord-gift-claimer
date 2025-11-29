@@ -1,4 +1,5 @@
 discord.py-self==2.0.1
 audioop-lts>=0.2.1
 uvloop>=0.19; platform_system != "Windows"
+orjson>=3.10.0
 orjson>=3.8.0

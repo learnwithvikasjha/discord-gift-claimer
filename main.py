@@ -2,18 +2,21 @@ import asyncio
 import logging
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Set
+from typing import Dict, Set, Optional
 
-import discord
 import orjson
+import discord
 
-
+# ---------------------------
+# Basic setup
+# ---------------------------
 LOGS_DIR = Path(__file__).with_name("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOGS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+LOG_FILE = LOGS_DIR / f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
 
+# Minimal logging configuration: INFO for important events, DEBUG if you explicitly enable it.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,28 +26,38 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("claim-gift")
+# suppress very verbose discord library logs by default
+logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("discord.gateway").setLevel(logging.WARNING)
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
 
 
+# ---------------------------
+# Utilities
+# ---------------------------
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _format_ms(value) -> str:
+def _format_ms(value: Optional[float]) -> str:
     return f"{value:.1f}ms" if value is not None else "?"
 
 
+# ---------------------------
+# Config dataclass + loaders
+# ---------------------------
 @dataclass
 class Config:
     token: str
-    claim_button_texts: Set[str] = field(default_factory=lambda: {"Claim Gift"})
+    claim_button_texts: Set[str] = field(default_factory=lambda: {"claim gift"})
     allowed_guild_ids: Set[int] = field(default_factory=set)
     allowed_channel_ids: Set[int] = field(default_factory=set)
+    worker_count: int = 2  # number of concurrent click workers
+    processed_ttl_seconds: int = 300  # how long to remember processed message IDs
 
 
 def _parse_id_list(values) -> Set[int]:
-    """Convert a list of IDs from JSON into a set of ints."""
     parsed: Set[int] = set()
     for value in values or []:
         try:
@@ -55,10 +68,7 @@ def _parse_id_list(values) -> Set[int]:
 
 
 def _parse_label_list(values, legacy_value: str = "") -> Set[str]:
-    """Convert list/str labels into a set of normalized, non-empty strings."""
     parsed: Set[str] = set()
-
-    # Accept list/tuple for multiple labels
     if isinstance(values, (list, tuple)):
         sources = values
     elif values:
@@ -69,15 +79,14 @@ def _parse_label_list(values, legacy_value: str = "") -> Set[str]:
     for raw in sources:
         text = str(raw).strip()
         if text:
-            parsed.add(text)
+            parsed.add(text.lower())
 
     legacy = str(legacy_value or "").strip()
     if legacy:
-        parsed.add(legacy)
+        parsed.add(legacy.lower())
 
     if not parsed:
-        parsed.add("Claim Gift")
-
+        parsed.add("claim gift")
     return parsed
 
 
@@ -95,77 +104,119 @@ def load_config() -> Config:
     claim_texts = _parse_label_list(raw.get("claim_button_texts"), raw.get("claim_button_text", ""))
     guild_ids = _parse_id_list(raw.get("allowed_guild_ids"))
     channel_ids = _parse_id_list(raw.get("allowed_channel_ids"))
+    worker_count = int(raw.get("worker_count", 2)) if raw.get("worker_count") else 2
+    ttl = int(raw.get("processed_ttl_seconds", 300)) if raw.get("processed_ttl_seconds") else 300
 
     return Config(
         token=token,
         claim_button_texts=claim_texts,
         allowed_guild_ids=guild_ids,
         allowed_channel_ids=channel_ids,
+        worker_count=max(1, min(8, worker_count)),  # clamp to a sane range
+        processed_ttl_seconds=max(30, ttl),
     )
 
 
+# ---------------------------
+# Main runtime
+# ---------------------------
 async def main() -> None:
     config = load_config()
-    claim_labels = {text.lower() for text in config.claim_button_texts}
-    processed_messages: Set[int] = set()
+    logger.info("Loaded configuration: workers=%d claim_texts=%s", config.worker_count, sorted(config.claim_button_texts))
 
-    client = discord.Client(bot=False)
+    # Intents: only enable what's required (minimizes gateway event noise)
+    intents = discord.Intents.none()
+    intents.messages = True
+    intents.message_content = True  # required to read message content/components in many discord.py builds
 
-    def message_allowed(message: discord.Message) -> bool:
-        if config.allowed_guild_ids:
-            if message.guild is None or message.guild.id not in config.allowed_guild_ids:
-                return False
-        if config.allowed_channel_ids and message.channel.id not in config.allowed_channel_ids:
-            return False
-        return True
+    client = discord.Client(bot=False, intents=intents)
 
-    async def click_claim_button(message: discord.Message, event_received_at: datetime, source: str) -> bool:
-        """Attempt to click the first allowed button as fast as possible."""
-        seen_labels = []
+    # A small bounded queue for click tasks. Bounded so memory won't explode during bursts.
+    click_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+
+    # processed_messages maps message_id -> timestamp when it was processed
+    processed_messages: Dict[int, datetime] = {}
+    processed_lock = asyncio.Lock()  # protect processed_messages
+
+    # Provide a periodic cleanup to remove stale entries
+    async def processed_cleanup_task():
+        while True:
+            await asyncio.sleep(max(10, config.processed_ttl_seconds // 4))
+            cutoff = _utcnow() - timedelta(seconds=config.processed_ttl_seconds)
+            async with processed_lock:
+                removed = [mid for mid, ts in processed_messages.items() if ts < cutoff]
+                for mid in removed:
+                    del processed_messages[mid]
+            if removed:
+                logger.debug("Cleaned up %d processed message ids", len(removed))
+
+    # Worker that performs clicks
+    async def worker(worker_id: int):
+        logger.info("Worker-%d started", worker_id)
+        while True:
+            item = await click_queue.get()
+            message = item["message"]
+            event_received_at = item["event_received_at"]
+            source = item["source"]
+            try:
+                await _attempt_click(message, event_received_at, source)
+            except Exception:
+                logger.exception("Unhandled exception in worker-%d while clicking message %s", worker_id, getattr(message, "id", "unknown"))
+            finally:
+                click_queue.task_done()
+
+    # the core click routine (keeps same click semantics as your original code)
+    async def _attempt_click(message: discord.Message, event_received_at: datetime, source: str) -> bool:
+        # compute a few cheap things early
+        msg_id = message.id
+        # iterate over components *once* and try to click the first matching interactive button
         saw_claim_label = False
+        seen_labels = []
         now = _utcnow()
         created_age_ms = (now - message.created_at).total_seconds() * 1000 if getattr(message, "created_at", None) else None
         edited_age_ms = (now - message.edited_at).total_seconds() * 1000 if getattr(message, "edited_at", None) else None
 
-        for row in message.components:
-            for component in getattr(row, "children", []):
-                label = getattr(component, "label", "")
+        # For speed, access components directly and avoid allocations where possible
+        for row in getattr(message, "components", []) or []:
+            for comp in getattr(row, "children", []) or []:
+                label = getattr(comp, "label", "") or ""
                 seen_labels.append(label)
-                normalized = label.strip().lower() if label else ""
-                if not normalized or normalized not in claim_labels:
+                normalized = label.strip().lower()
+                if not normalized or normalized not in config.claim_button_texts:
                     continue
 
                 saw_claim_label = True
-                custom_id = getattr(component, "custom_id", None)
-                is_url = bool(getattr(component, "url", None))
-                disabled = bool(getattr(component, "disabled", False))
+                custom_id = getattr(comp, "custom_id", None)
+                is_url = bool(getattr(comp, "url", None))
+                disabled = bool(getattr(comp, "disabled", False))
 
                 if disabled:
-                    logger.info('Skipping disabled button "%s" on message %s in %s', label, message.id, message.channel)
+                    # cheap log at debug level
+                    logger.debug('Skipping disabled button "%s" on message %s in %s', label, msg_id, message.channel)
                     continue
 
                 if is_url or not custom_id:
-                    logger.info(
-                        'Skipping non-interactive button "%s" on message %s in %s (url=%s custom_id=%s)',
-                        label,
-                        message.id,
-                        message.channel,
-                        getattr(component, "url", None),
-                        custom_id,
-                    )
+                    logger.debug('Skipping non-interactive button "%s" on message %s (url=%s custom_id=%s)', label, msg_id, getattr(comp, "url", None), custom_id)
                     continue
 
-                processed_messages.add(message.id)  # prevent duplicate attempts on rapid edits
+                # mark processed early (guard against quick duplicate edits)
+                async with processed_lock:
+                    if msg_id in processed_messages:
+                        logger.debug("Already processed message %s", msg_id)
+                        return False
+                    processed_messages[msg_id] = _utcnow()
+
                 before_click = _utcnow()
                 since_event_ms = (before_click - event_received_at).total_seconds() * 1000
                 try:
-                    await component.click()
+                    # this is the actual click call you used previously
+                    await comp.click()
                     after_click = _utcnow()
                     total_since_event_ms = (after_click - event_received_at).total_seconds() * 1000
                     logger.info(
                         'Clicked "%s" on message %s in %s via %s (age=%s edited_age=%s since_event=%s after_click=%s custom_id=%s)',
                         label or next(iter(config.claim_button_texts)),
-                        message.id,
+                        msg_id,
                         message.channel,
                         source,
                         _format_ms(created_age_ms),
@@ -176,97 +227,93 @@ async def main() -> None:
                     )
                     return True
                 except Exception as exc:
-                    logger.error(
-                        'Failed to click button on message %s (custom_id=%s url=%s disabled=%s since_event=%s): %s',
-                        message.id,
-                        custom_id,
-                        getattr(component, "url", None),
-                        disabled,
-                        _format_ms(since_event_ms),
-                        exc,
-                    )
+                    logger.error("Failed to click button on message %s (custom_id=%s since_event=%s): %s", msg_id, custom_id, _format_ms(since_event_ms), exc)
                     return False
 
+        # If we get here, no clickable button found
         if saw_claim_label:
-            logger.info(
-                "No clickable claim buttons on message %s (labels=%s)",
-                message.id,
-                ", ".join(repr(label) for label in seen_labels) if seen_labels else "none",
-            )
+            logger.debug("No clickable claim buttons on message %s (labels=%s)", getattr(message, "id", None), ", ".join(repr(l) for l in seen_labels) or "none")
         else:
-            logger.info(
-                "No claim labels matched on message %s (labels=%s)",
-                message.id,
-                ", ".join(repr(label) for label in seen_labels) if seen_labels else "none",
-            )
+            logger.debug("No claim labels matched on message %s (labels=%s)", getattr(message, "id", None), ", ".join(repr(l) for l in seen_labels) or "none")
         return False
 
-    async def handle_message(message: discord.Message, source: str) -> None:
-        event_received_at = _utcnow()
-        created_age_ms = None
-        edited_age_ms = None
-        if getattr(message, "created_at", None):
-            created_age_ms = (event_received_at - message.created_at).total_seconds() * 1000
-        if getattr(message, "edited_at", None):
-            edited_age_ms = (event_received_at - message.edited_at).total_seconds() * 1000
-        components = getattr(message, "components", None) or []
-        component_children = []
-        for row in components:
-            component_children.extend(getattr(row, "children", []))
+    # Fast allowlist check (cheap early return)
+    def message_allowed(message: discord.Message) -> bool:
+        if config.allowed_guild_ids:
+            g = message.guild
+            if g is None or g.id not in config.allowed_guild_ids:
+                return False
+        if config.allowed_channel_ids and message.channel.id not in config.allowed_channel_ids:
+            return False
+        return True
 
-        logger.info(
-            "%s event for message %s in %s (created_age=%s edited_age=%s components=%s)",
-            source,
-            message.id,
-            message.channel,
-            _format_ms(created_age_ms),
-            _format_ms(edited_age_ms),
-            len(component_children),
-        )
+    # Enqueue a message for worker processing (non-blocking)
+    async def enqueue_click(message: discord.Message, event_received_at: datetime, source: str) -> None:
+        try:
+            click_queue.put_nowait({"message": message, "event_received_at": event_received_at, "source": source})
+        except asyncio.QueueFull:
+            logger.warning("Click queue is full; dropping message %s", message.id)
 
-        if message.author == client.user:
-            logger.info("Skipping message %s (self message)", message.id)
-            return
-        if not message_allowed(message):
-            logger.info("Skipping message %s (not in allowlists)", message.id)
-            return
-        if not component_children:
-            logger.info("Skipping message %s (no components with children)", message.id)
-            return
-        if message.id in processed_messages:
-            logger.info("Skipping message %s (already processed/attempted)", message.id)
-            return
-
-        async def _click_task():
-            try:
-                await click_claim_button(message, event_received_at, source)
-            except Exception as exc:  # pragma: no cover - safeguard
-                logger.exception("Click task failed for message %s: %s", message.id, exc)
-
-        asyncio.create_task(_click_task())
-
+    # Event handlers: minimal and early-exit fast
     @client.event
     async def on_ready():
         logger.info("Ready as %s (%s)", client.user, client.user.id)
         if config.allowed_guild_ids:
             logger.info("Guild allowlist: %s", ", ".join(str(g) for g in sorted(config.allowed_guild_ids)))
         if config.allowed_channel_ids:
-            logger.info(
-                "Channel allowlist: %s",
-                ", ".join(str(c) for c in sorted(config.allowed_channel_ids)),
-            )
+            logger.info("Channel allowlist: %s", ", ".join(str(c) for c in sorted(config.allowed_channel_ids)))
+
+    async def _handle_incoming(message: discord.Message, source: str):
+        # very cheap early checks
+        if message.author == client.user:
+            return
+        if not message_allowed(message):
+            return
+
+        # quickly test whether there are any component children; avoid building lists
+        comps = getattr(message, "components", None) or []
+        has_children = False
+        for r in comps:
+            if getattr(r, "children", None):
+                has_children = True
+                break
+        if not has_children:
+            return
+
+        # ensure we don't enqueue duplicates
+        async with processed_lock:
+            if message.id in processed_messages:
+                return
+
+        # small metadata for metrics; cheap timestamp capture
+        event_received_at = _utcnow()
+        # enqueue for background workers (fast)
+        await enqueue_click(message, event_received_at, source)
 
     @client.event
     async def on_message(message: discord.Message):
-        await handle_message(message, source="message")
+        # don't await heavy work here; just call the fast handler
+        await _handle_incoming(message, source="message")
 
     @client.event
-    async def on_message_edit(_, after: discord.Message):
-        await handle_message(after, source="edit")
+    async def on_message_edit(before, after: discord.Message):
+        await _handle_incoming(after, source="edit")
 
+    # start background tasks and workers
+    # - processed cleanup
+    asyncio.create_task(processed_cleanup_task())
+
+    # - worker pool
+    for i in range(config.worker_count):
+        asyncio.create_task(worker(i + 1))
+
+    # start client (this call blocks until disconnect)
     await client.start(config.token)
 
 
+# ---------------------------
+# Entrypoint
+# ---------------------------
 if __name__ == "__main__":
     if sys.platform != "win32":
         try:
@@ -274,16 +321,16 @@ if __name__ == "__main__":
 
             uvloop.install()
             logger.info("uvloop event loop installed for improved performance.")
-        except ImportError:
+        except Exception:
             logger.info("uvloop not installed; using default event loop.")
 
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Shutting down.")
+        logger.info("Shutting down (KeyboardInterrupt).")
     except (FileNotFoundError, ValueError) as exc:
         logger.error("%s", exc)
         raise SystemExit(1) from exc
-    except Exception as exc:  # pragma: no cover - unexpected crash guard
+    except Exception as exc:
         logger.exception("Unexpected error: %s", exc)
         raise SystemExit(1) from exc
