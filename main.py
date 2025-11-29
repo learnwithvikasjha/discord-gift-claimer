@@ -354,6 +354,8 @@ async def main() -> None:
     async def _handle_incoming(message: discord.Message, source: str):
         if source == "message":
             stats["messages_seen"] += 1
+            # We only act on edits; ignore new message events
+            return
         else:
             stats["edits_seen"] += 1
         t_receive = perf_counter()
