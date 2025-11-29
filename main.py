@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Set, Optional
+from collections import deque
+from time import perf_counter
 
 import orjson
 import discord
@@ -51,6 +53,25 @@ def _utcnow() -> datetime:
 
 def _format_ms(value: Optional[float]) -> str:
     return f"{value:.1f}ms" if value is not None else "?"
+
+LAT_WINDOW = 200
+metrics = {
+    "enqueue_latencies": deque(maxlen=LAT_WINDOW),
+    "queue_wait": deque(maxlen=LAT_WINDOW),
+    "handler_time": deque(maxlen=LAT_WINDOW),
+}
+
+
+def _sample_stats(bucket: deque, value: float) -> None:
+    bucket.append(value)
+
+
+def _pctile(values: deque, p: float) -> Optional[float]:
+    if not values:
+        return None
+    data = sorted(values)
+    idx = int((len(data) - 1) * (p / 100))
+    return data[idx]
 
 
 # ---------------------------
@@ -182,8 +203,15 @@ async def main() -> None:
             await asyncio.sleep(30)
             async with processed_lock:
                 processed_count = len(processed_messages)
+            enqueue_p50 = _pctile(metrics["enqueue_latencies"], 50)
+            enqueue_p95 = _pctile(metrics["enqueue_latencies"], 95)
+            wait_p50 = _pctile(metrics["queue_wait"], 50)
+            wait_p95 = _pctile(metrics["queue_wait"], 95)
+            handler_p50 = _pctile(metrics["handler_time"], 50)
+            handler_p95 = _pctile(metrics["handler_time"], 95)
             logger.info(
-                "Heartbeat: msg=%d edit=%d allowed=%d enqueued=%d clicked=%d failed=%d queue=%d processed=%d",
+                "Heartbeat: msg=%d edit=%d allowed=%d enqueued=%d clicked=%d failed=%d queue=%d processed=%d "
+                "enqueue_p50=%s enqueue_p95=%s wait_p50=%s wait_p95=%s handler_p50=%s handler_p95=%s",
                 stats["messages_seen"],
                 stats["edits_seen"],
                 stats["allowed"],
@@ -192,6 +220,12 @@ async def main() -> None:
                 stats["click_fail"],
                 click_queue.qsize(),
                 processed_count,
+                _format_ms(enqueue_p50) if enqueue_p50 is not None else "?",
+                _format_ms(enqueue_p95) if enqueue_p95 is not None else "?",
+                _format_ms(wait_p50) if wait_p50 is not None else "?",
+                _format_ms(wait_p95) if wait_p95 is not None else "?",
+                _format_ms(handler_p50) if handler_p50 is not None else "?",
+                _format_ms(handler_p95) if handler_p95 is not None else "?",
             )
 
     # Worker that performs clicks
@@ -202,8 +236,14 @@ async def main() -> None:
             message = item["message"]
             event_received_at = item["event_received_at"]
             source = item["source"]
+            enqueue_time = item.get("enqueue_time")
             try:
+                if enqueue_time is not None:
+                    _sample_stats(metrics["queue_wait"], (perf_counter() - enqueue_time) * 1000.0)
+                handler_start = perf_counter()
                 await _attempt_click(message, event_received_at, source)
+                handler_end = perf_counter()
+                _sample_stats(metrics["handler_time"], (handler_end - handler_start) * 1000.0)
             except Exception:
                 logger.exception("Unhandled exception in worker-%d while clicking message %s", worker_id, getattr(message, "id", "unknown"))
             finally:
@@ -296,7 +336,9 @@ async def main() -> None:
     # Enqueue a message for worker processing (non-blocking)
     async def enqueue_click(message: discord.Message, event_received_at: datetime, source: str) -> None:
         try:
-            click_queue.put_nowait({"message": message, "event_received_at": event_received_at, "source": source})
+            click_queue.put_nowait(
+                {"message": message, "event_received_at": event_received_at, "source": source, "enqueue_time": perf_counter()}
+            )
         except asyncio.QueueFull:
             logger.warning("Click queue is full; dropping message %s", message.id)
 
@@ -314,6 +356,7 @@ async def main() -> None:
             stats["messages_seen"] += 1
         else:
             stats["edits_seen"] += 1
+        t_receive = perf_counter()
 
         # very cheap early checks
         if message.author == client.user:
@@ -342,6 +385,7 @@ async def main() -> None:
         # enqueue for background workers (fast)
         await enqueue_click(message, event_received_at, source)
         stats["enqueued"] += 1
+        _sample_stats(metrics["enqueue_latencies"], (perf_counter() - t_receive) * 1000.0)
 
     @client.event
     async def on_message(message: discord.Message):
