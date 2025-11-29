@@ -237,7 +237,13 @@ async def main() -> None:
             logger.info("Skipping message %s (already processed/attempted)", message.id)
             return
 
-        await click_claim_button(message, event_received_at, source)
+        async def _click_task():
+            try:
+                await click_claim_button(message, event_received_at, source)
+            except Exception as exc:  # pragma: no cover - safeguard
+                logger.exception("Click task failed for message %s: %s", message.id, exc)
+
+        asyncio.create_task(_click_task())
 
     @client.event
     async def on_ready():
@@ -262,6 +268,15 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if sys.platform != "win32":
+        try:
+            import uvloop
+
+            uvloop.install()
+            logger.info("uvloop event loop installed for improved performance.")
+        except ImportError:
+            logger.info("uvloop not installed; using default event loop.")
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
