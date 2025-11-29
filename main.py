@@ -125,11 +125,21 @@ async def main() -> None:
     logger.info("Loaded configuration: workers=%d claim_texts=%s", config.worker_count, sorted(config.claim_button_texts))
 
     # Intents: only enable what's required (minimizes gateway event noise)
-    intents = discord.Intents.none()
-    intents.messages = True
-    intents.message_content = True  # required to read message content/components in many discord.py builds
+    intents = None
+    if hasattr(discord, "Intents"):
+        intents = discord.Intents.none()
+        intents.messages = True
+        intents.message_content = True  # required to read message content/components in many discord.py builds
 
-    client = discord.Client(bot=False, intents=intents)
+    client_kwargs = {"bot": False}
+    if intents is not None:
+        client_kwargs["intents"] = intents
+
+    try:
+        client = discord.Client(**client_kwargs)
+    except TypeError:
+        client_kwargs.pop("intents", None)
+        client = discord.Client(**client_kwargs)
 
     # A small bounded queue for click tasks. Bounded so memory won't explode during bursts.
     click_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
