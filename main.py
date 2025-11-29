@@ -14,7 +14,16 @@ import discord
 # ---------------------------
 LOGS_DIR = Path(__file__).with_name("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOGS_DIR / f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
+APP_LOG = LOGS_DIR / "app.log"
+if APP_LOG.exists():
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    rotated = LOGS_DIR / f"app_{timestamp}.log"
+    try:
+        APP_LOG.rename(rotated)
+    except OSError as exc:
+        # Fall back to continuing with the existing log if rotation fails
+        print(f"Warning: could not rotate existing app.log: {exc}", file=sys.stderr)
+LOG_FILE = APP_LOG
 
 # Minimal logging configuration: INFO for important events, DEBUG if you explicitly enable it.
 logging.basicConfig(
