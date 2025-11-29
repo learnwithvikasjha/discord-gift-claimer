@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import sys
 from dataclasses import dataclass, field
@@ -8,6 +7,7 @@ from pathlib import Path
 from typing import Set
 
 import discord
+import orjson
 
 
 LOGS_DIR = Path(__file__).with_name("logs")
@@ -85,8 +85,8 @@ def load_config() -> Config:
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Missing config file at {CONFIG_PATH}")
 
-    with CONFIG_PATH.open("r", encoding="utf-8") as fp:
-        raw = json.load(fp)
+    with CONFIG_PATH.open("rb") as fp:
+        raw = orjson.loads(fp.read())
 
     token = str(raw.get("token", "")).strip()
     if not token or token == "YOUR_DISCORD_TOKEN":
@@ -109,7 +109,7 @@ async def main() -> None:
     claim_labels = {text.lower() for text in config.claim_button_texts}
     processed_messages: Set[int] = set()
 
-    client = discord.Client()
+    client = discord.Client(bot=False)
 
     def message_allowed(message: discord.Message) -> bool:
         if config.allowed_guild_ids:
