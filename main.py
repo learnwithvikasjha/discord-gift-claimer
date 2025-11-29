@@ -5,8 +5,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Set, Optional
-from collections import deque
-from time import perf_counter
 
 import orjson
 import discord
@@ -53,25 +51,6 @@ def _utcnow() -> datetime:
 
 def _format_ms(value: Optional[float]) -> str:
     return f"{value:.1f}ms" if value is not None else "?"
-
-LAT_WINDOW = 200
-metrics = {
-    "enqueue_latencies": deque(maxlen=LAT_WINDOW),
-    "queue_wait": deque(maxlen=LAT_WINDOW),
-    "handler_time": deque(maxlen=LAT_WINDOW),
-}
-
-
-def _sample_stats(bucket: deque, value: float) -> None:
-    bucket.append(value)
-
-
-def _pctile(values: deque, p: float) -> Optional[float]:
-    if not values:
-        return None
-    data = sorted(values)
-    idx = int((len(data) - 1) * (p / 100))
-    return data[idx]
 
 
 # ---------------------------
@@ -153,23 +132,7 @@ def load_config() -> Config:
 async def main() -> None:
     config = load_config()
     logger.info("Loaded configuration: workers=%d claim_texts=%s", config.worker_count, sorted(config.claim_button_texts))
-
-    # Intents: only enable what's required (minimizes gateway event noise)
-    intents = None
-    if hasattr(discord, "Intents"):
-        intents = discord.Intents.none()
-        intents.messages = True
-        intents.message_content = True  # required to read message content/components in many discord.py builds
-
-    client_kwargs = {"bot": False}
-    if intents is not None:
-        client_kwargs["intents"] = intents
-
-    try:
-        client = discord.Client(**client_kwargs)
-    except TypeError:
-        client_kwargs.pop("intents", None)
-        client = discord.Client(**client_kwargs)
+    client = discord.Client(bot=False)
 
     # A small bounded queue for click tasks. Bounded so memory won't explode during bursts.
     click_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
@@ -177,14 +140,6 @@ async def main() -> None:
     # processed_messages maps message_id -> timestamp when it was processed
     processed_messages: Dict[int, datetime] = {}
     processed_lock = asyncio.Lock()  # protect processed_messages
-    stats = {
-        "messages_seen": 0,
-        "edits_seen": 0,
-        "allowed": 0,
-        "enqueued": 0,
-        "clicked": 0,
-        "click_fail": 0,
-    }
 
     # Provide a periodic cleanup to remove stale entries
     async def processed_cleanup_task():
@@ -198,36 +153,6 @@ async def main() -> None:
             if removed:
                 logger.debug("Cleaned up %d processed message ids", len(removed))
 
-    async def stats_reporter():
-        while True:
-            await asyncio.sleep(30)
-            async with processed_lock:
-                processed_count = len(processed_messages)
-            enqueue_p50 = _pctile(metrics["enqueue_latencies"], 50)
-            enqueue_p95 = _pctile(metrics["enqueue_latencies"], 95)
-            wait_p50 = _pctile(metrics["queue_wait"], 50)
-            wait_p95 = _pctile(metrics["queue_wait"], 95)
-            handler_p50 = _pctile(metrics["handler_time"], 50)
-            handler_p95 = _pctile(metrics["handler_time"], 95)
-            logger.info(
-                "Heartbeat: msg=%d edit=%d allowed=%d enqueued=%d clicked=%d failed=%d queue=%d processed=%d "
-                "enqueue_p50=%s enqueue_p95=%s wait_p50=%s wait_p95=%s handler_p50=%s handler_p95=%s",
-                stats["messages_seen"],
-                stats["edits_seen"],
-                stats["allowed"],
-                stats["enqueued"],
-                stats["clicked"],
-                stats["click_fail"],
-                click_queue.qsize(),
-                processed_count,
-                _format_ms(enqueue_p50) if enqueue_p50 is not None else "?",
-                _format_ms(enqueue_p95) if enqueue_p95 is not None else "?",
-                _format_ms(wait_p50) if wait_p50 is not None else "?",
-                _format_ms(wait_p95) if wait_p95 is not None else "?",
-                _format_ms(handler_p50) if handler_p50 is not None else "?",
-                _format_ms(handler_p95) if handler_p95 is not None else "?",
-            )
-
     # Worker that performs clicks
     async def worker(worker_id: int):
         logger.info("Worker-%d started", worker_id)
@@ -236,14 +161,8 @@ async def main() -> None:
             message = item["message"]
             event_received_at = item["event_received_at"]
             source = item["source"]
-            enqueue_time = item.get("enqueue_time")
             try:
-                if enqueue_time is not None:
-                    _sample_stats(metrics["queue_wait"], (perf_counter() - enqueue_time) * 1000.0)
-                handler_start = perf_counter()
                 await _attempt_click(message, event_received_at, source)
-                handler_end = perf_counter()
-                _sample_stats(metrics["handler_time"], (handler_end - handler_start) * 1000.0)
             except Exception:
                 logger.exception("Unhandled exception in worker-%d while clicking message %s", worker_id, getattr(message, "id", "unknown"))
             finally:
@@ -297,7 +216,6 @@ async def main() -> None:
                     await comp.click()
                     after_click = _utcnow()
                     total_since_event_ms = (after_click - event_received_at).total_seconds() * 1000
-                    stats["clicked"] += 1
                     logger.info(
                         'Clicked "%s" on message %s in %s via %s (age=%s edited_age=%s since_event=%s after_click=%s custom_id=%s)',
                         label or next(iter(config.claim_button_texts)),
@@ -312,7 +230,6 @@ async def main() -> None:
                     )
                     return True
                 except Exception as exc:
-                    stats["click_fail"] += 1
                     logger.error("Failed to click button on message %s (custom_id=%s since_event=%s): %s", msg_id, custom_id, _format_ms(since_event_ms), exc)
                     return False
 
@@ -336,9 +253,7 @@ async def main() -> None:
     # Enqueue a message for worker processing (non-blocking)
     async def enqueue_click(message: discord.Message, event_received_at: datetime, source: str) -> None:
         try:
-            click_queue.put_nowait(
-                {"message": message, "event_received_at": event_received_at, "source": source, "enqueue_time": perf_counter()}
-            )
+            click_queue.put_nowait({"message": message, "event_received_at": event_received_at, "source": source})
         except asyncio.QueueFull:
             logger.warning("Click queue is full; dropping message %s", message.id)
 
@@ -353,19 +268,14 @@ async def main() -> None:
 
     async def _handle_incoming(message: discord.Message, source: str):
         if source == "message":
-            stats["messages_seen"] += 1
             # We only act on edits; ignore new message events
             return
-        else:
-            stats["edits_seen"] += 1
-        t_receive = perf_counter()
 
         # very cheap early checks
         if message.author == client.user:
             return
         if not message_allowed(message):
             return
-        stats["allowed"] += 1
 
         # quickly test whether there are any component children; avoid building lists
         comps = getattr(message, "components", None) or []
@@ -386,8 +296,6 @@ async def main() -> None:
         event_received_at = _utcnow()
         # enqueue for background workers (fast)
         await enqueue_click(message, event_received_at, source)
-        stats["enqueued"] += 1
-        _sample_stats(metrics["enqueue_latencies"], (perf_counter() - t_receive) * 1000.0)
 
     @client.event
     async def on_message(message: discord.Message):
@@ -399,11 +307,7 @@ async def main() -> None:
         await _handle_incoming(after, source="edit")
 
     # start background tasks and workers
-    # - processed cleanup
     asyncio.create_task(processed_cleanup_task())
-    asyncio.create_task(stats_reporter())
-
-    # - worker pool
     for i in range(config.worker_count):
         asyncio.create_task(worker(i + 1))
 
